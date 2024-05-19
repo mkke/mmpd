@@ -1,5 +1,6 @@
 package mmpd
 
+// PlayerState represents the current player state.
 type PlayerState string
 
 const (

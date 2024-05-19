@@ -6,6 +6,7 @@ import (
 	"github.com/fhs/gompd/v2/mpd"
 )
 
+// Status represents the current player status.
 type Status struct {
 	// the name of the current partition (see Partition commands)
 	Partition string
@@ -77,7 +78,7 @@ type Status struct {
 	Error string
 }
 
-func ParseAttr(attrs mpd.Attrs) *Status {
+func ParseStatusAttrs(attrs mpd.Attrs) *Status {
 	status := &Status{}
 	for k, v := range attrs {
 		switch k {
@@ -132,7 +133,7 @@ func ParseAttr(attrs mpd.Attrs) *Status {
 		case "updating_db":
 			status.UpdatingDB = v
 		case "error":
-
+			status.Error = v
 		}
 	}
 	return status

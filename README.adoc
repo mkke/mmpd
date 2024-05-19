@@ -1,0 +1,9 @@
+:toc: macro
+
+image:https://goreportcard.com/badge/github.com/mkke/mmpd["Go Report Card", link="https://goreportcard.com/report/mkke/mmpd"]
+image:https://godoc.org/github.com/mkke/mmpd?status.svg["GoDoc", link="https://godoc.org/github.com/mkke/mmpd"]
+
+## Music Player Daemon (mpd) client enhancements
+
+This module contains some enhancements meant to be used with github.com/fhs/gompd/v2.
+

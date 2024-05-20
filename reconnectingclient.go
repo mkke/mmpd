@@ -3,6 +3,7 @@ package mmpd
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/fhs/gompd/v2/mpd"
@@ -13,17 +14,22 @@ var ErrNotConnected = errors.New("not connected")
 
 type ReconnectingClient struct {
 	*mpd.Client
-	network               string
-	addr                  string
-	password              string
-	keepalive             bool
-	blocking              bool
-	lock                  deadlock.RWMutex
-	closeCh               chan struct{}
-	keepaliveTicker       *time.Ticker
-	Playlist              []PlaylistEntry
-	connectedListeners    map[*ConnectedListener]struct{}
-	disconnectedListeners map[*DisconnectedListener]struct{}
+	network                    string
+	addr                       string
+	password                   string
+	keepalive                  bool
+	pingFunc                   PingFunc
+	blocking                   bool
+	watchSubsystems            []Subsystem
+	connectLock                deadlock.RWMutex
+	idleStateLock              deadlock.Mutex
+	activeCommands             int
+	closeCh                    chan struct{}
+	keepaliveTicker            *time.Ticker
+	Playlist                   []PlaylistEntry
+	connectedListeners         map[*ConnectedListener]struct{}
+	disconnectedListeners      map[*DisconnectedListener]struct{}
+	subsystemsChangedListeners map[*SubsystemsChangedListener]struct{}
 }
 
 type ClientOption func(*ReconnectingClient)
@@ -46,11 +52,34 @@ func WithKeepalive(keepalive bool) ClientOption {
 	}
 }
 
+type PingFunc func(client *ReconnectingClient) error
+
+// WithPingFunc sets an alternative function for keepalive testing.
+//
+// This can e.g. be used to replace the ping with a status check.
+func WithPingFunc(pingFunc PingFunc) ClientOption {
+	return func(client *ReconnectingClient) {
+		// we expect a non-nil func
+		if pingFunc != nil {
+			client.pingFunc = pingFunc
+		}
+	}
+}
+
+func WithWatchSubsystems(subsystems ...Subsystem) ClientOption {
+	return func(client *ReconnectingClient) {
+		client.watchSubsystems = subsystems
+	}
+}
+
 func NewReconnectingClient(network, addr string, options ...ClientOption) (*ReconnectingClient, error) {
 	c := &ReconnectingClient{
-		network:               network,
-		addr:                  addr,
-		keepalive:             true,
+		network:   network,
+		addr:      addr,
+		keepalive: true,
+		pingFunc: func(client *ReconnectingClient) error {
+			return client.Ping()
+		},
 		connectedListeners:    map[*ConnectedListener]struct{}{},
 		disconnectedListeners: map[*DisconnectedListener]struct{}{},
 	}
@@ -82,8 +111,8 @@ func NewReconnectingClient(network, addr string, options ...ClientOption) (*Reco
 }
 
 func (c *ReconnectingClient) Connect() error {
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	c.connectLock.Lock()
+	defer c.connectLock.Unlock()
 
 	return c.connect()
 }
@@ -102,33 +131,30 @@ func (c *ReconnectingClient) connect() error {
 					case <-c.closeCh:
 						return
 					case <-c.keepaliveTicker.C:
-						c.lock.RLock()
-						if err := c.Client.Ping(); err != nil {
-							c.lock.RUnlock()
+						c.connectLock.RLock()
+						if err := c.pingFunc(c); err != nil {
+							c.connectLock.RUnlock()
 							fmt.Printf("mpd: keepalive ping failed: %v; starting reconnect...\n", err)
 							c.reconnect()
 						} else {
-							c.lock.RUnlock()
+							c.connectLock.RUnlock()
 						}
 					}
 				}
 			}()
 		}
+
 		fmt.Printf("mpd: notifying connected to %s %s\n", c.network, c.addr)
-		// allow the listeners to acquire the lock
-		go func() {
-			for l := range c.connectedListeners {
-				l.fn(c)
-			}
-		}()
+		// allow the listeners to acquire the connectLock
+		go c.notifyConnected()
 		return nil
 	}
 }
 
 func (c *ReconnectingClient) reconnect() {
 	// get rid of old client
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	c.connectLock.Lock()
+	defer c.connectLock.Unlock()
 
 	_ = c.close()
 
@@ -150,10 +176,10 @@ connect:
 }
 
 func (c *ReconnectingClient) Close() error {
-	close(c.closeCh) // outside lock
+	close(c.closeCh) // outside connectLock
 
-	c.lock.Lock()
-	defer c.lock.Unlock()
+	c.connectLock.Lock()
+	defer c.connectLock.Unlock()
 
 	return c.close()
 }
@@ -168,27 +194,64 @@ func (c *ReconnectingClient) close() error {
 		err := c.Client.Close()
 		c.Client = nil
 		fmt.Printf("mpd: notifying disconnected from %s %s\n", c.network, c.addr)
-		// allow the listeners to acquire the lock
-		go func() {
-			for l := range c.disconnectedListeners {
-				l.fn(c)
-			}
-		}()
+		// allow the listeners to acquire the connectLock
+		go c.notifyDisconnected()
 		return err
 	}
 
 	return nil
 }
 
+// Do runs a client command.
+//
+// All commands must be run via Do() so they are
+// protected by the connectLock and obey correct idle behavior.
 func (c *ReconnectingClient) Do(fn func(client *ReconnectingClient) error) error {
-	c.lock.RLock()
-	defer c.lock.RUnlock()
+	c.connectLock.RLock()
+	defer c.connectLock.RUnlock()
 
 	if c.Client == nil {
 		return ErrNotConnected
 	} else {
+		// TODO
+		//if c.watchSubsystems != nil {
+		//	c.idleStateLock.Lock()
+		//	if c.activeCommands == 0 {
+		//		// terminate idle command
+		//		if subsystems, err := c.noIdle(); err != nil {
+		//			c.idleStateLock.Unlock()
+		//			return err
+		//		} else {
+		//			go c.notifySubsystemsChanged(subsystems)
+		//		}
+		//	}
+		//	c.activeCommands++
+		//	c.idleStateLock.Unlock()
+		//
+		//	defer func() {
+		//		c.idleStateLock.Lock()
+		//		c.activeCommands--
+		//		if c.activeCommands == 0 {
+		//			// reestablish idle command
+		//			if subsystems, err := c.idle(c.watchSubsystems...); err != nil {
+		//				return
+		//			}
+		//		}
+		//		c.idleStateLock.Unlock()
+		//	}()
+		//}
 		return fn(c)
 	}
+}
+
+func (c *ReconnectingClient) idle(subsystems ...Subsystem) ([]Subsystem, error) {
+	changed, err := c.Command("idle %s", mpd.Quoted(strings.Join(StringsForSubsystems(subsystems), " "))).Strings("changed")
+	return SubsystemsForStrings(changed), err
+}
+
+func (c *ReconnectingClient) noIdle() ([]Subsystem, error) {
+	subsystems, err := c.Command("noidle").Strings("changed")
+	return SubsystemsForStrings(subsystems), err
 }
 
 type ConnectedListener struct {
@@ -209,6 +272,12 @@ func (c *ReconnectingClient) RemoveConnectedListener(l *ConnectedListener) {
 	delete(c.connectedListeners, l)
 }
 
+func (c *ReconnectingClient) notifyConnected() {
+	for l := range c.connectedListeners {
+		l.fn(c)
+	}
+}
+
 type DisconnectedListener struct {
 	fn func(client *ReconnectingClient)
 }
@@ -219,10 +288,40 @@ func NewDisconnectedListener(fn func(client *ReconnectingClient)) *DisconnectedL
 	}
 }
 
-func (c *ReconnectingClient) AddOnDisconnectedListener(l *DisconnectedListener) {
+func (c *ReconnectingClient) AddDisconnectedListener(l *DisconnectedListener) {
 	c.disconnectedListeners[l] = struct{}{}
 }
 
 func (c *ReconnectingClient) RemoveDisconnectedListener(l *DisconnectedListener) {
 	delete(c.disconnectedListeners, l)
+}
+
+func (c *ReconnectingClient) notifyDisconnected() {
+	for l := range c.disconnectedListeners {
+		l.fn(c)
+	}
+}
+
+type SubsystemsChangedListener struct {
+	fn func(client *ReconnectingClient, subsystems []Subsystem)
+}
+
+func NewSubsystemsChangedListener(fn func(client *ReconnectingClient, subsystems []Subsystem)) *SubsystemsChangedListener {
+	return &SubsystemsChangedListener{
+		fn: fn,
+	}
+}
+
+func (c *ReconnectingClient) AddSubsystemsChangedListener(l *SubsystemsChangedListener) {
+	c.subsystemsChangedListeners[l] = struct{}{}
+}
+
+func (c *ReconnectingClient) RemoveSubsystemsChangedListener(l *SubsystemsChangedListener) {
+	delete(c.subsystemsChangedListeners, l)
+}
+
+func (c *ReconnectingClient) notifySubsystemsChanged(subsystems []Subsystem) {
+	for l := range c.subsystemsChangedListeners {
+		l.fn(c, subsystems)
+	}
 }

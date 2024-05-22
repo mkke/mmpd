@@ -27,9 +27,10 @@ type ReconnectingClient struct {
 	closeCh                    chan struct{}
 	keepaliveTicker            *time.Ticker
 	Playlist                   []PlaylistEntry
-	connectedListeners         map[*ConnectedListener]struct{}
-	disconnectedListeners      map[*DisconnectedListener]struct{}
-	subsystemsChangedListeners map[*SubsystemsChangedListener]struct{}
+	ConnectedListeners         *ListenerSet[*ConnectedListener]
+	DisconnectedListeners      *ListenerSet[*DisconnectedListener]
+	SubsystemsChangedListeners *ListenerSet[*SubsystemsChangedListener]
+	StatusChangedListeners     *ListenerSet[*StatusChangedListener]
 }
 
 type ClientOption func(*ReconnectingClient)
@@ -80,8 +81,10 @@ func NewReconnectingClient(network, addr string, options ...ClientOption) (*Reco
 		pingFunc: func(client *ReconnectingClient) error {
 			return client.Ping()
 		},
-		connectedListeners:    map[*ConnectedListener]struct{}{},
-		disconnectedListeners: map[*DisconnectedListener]struct{}{},
+		ConnectedListeners:         NewListenerSet[*ConnectedListener](),
+		DisconnectedListeners:      NewListenerSet[*DisconnectedListener](),
+		SubsystemsChangedListeners: NewListenerSet[*SubsystemsChangedListener](),
+		StatusChangedListeners:     NewListenerSet[*StatusChangedListener](),
 	}
 	for _, option := range options {
 		option(c)
@@ -146,7 +149,7 @@ func (c *ReconnectingClient) connect() error {
 
 		fmt.Printf("mpd: notifying connected to %s %s\n", c.network, c.addr)
 		// allow the listeners to acquire the connectLock
-		go c.notifyConnected()
+		go c.ConnectedListeners.Notify(func(l *ConnectedListener) { l.Connected(c) })
 		return nil
 	}
 }
@@ -195,7 +198,7 @@ func (c *ReconnectingClient) close() error {
 		c.Client = nil
 		fmt.Printf("mpd: notifying disconnected from %s %s\n", c.network, c.addr)
 		// allow the listeners to acquire the connectLock
-		go c.notifyDisconnected()
+		go c.DisconnectedListeners.Notify(func(l *DisconnectedListener) { l.Disconnected(c) })
 		return err
 	}
 
@@ -252,76 +255,4 @@ func (c *ReconnectingClient) idle(subsystems ...Subsystem) ([]Subsystem, error) 
 func (c *ReconnectingClient) noIdle() ([]Subsystem, error) {
 	subsystems, err := c.Command("noidle").Strings("changed")
 	return SubsystemsForStrings(subsystems), err
-}
-
-type ConnectedListener struct {
-	fn func(client *ReconnectingClient)
-}
-
-func NewConnectedListener(fn func(client *ReconnectingClient)) *ConnectedListener {
-	return &ConnectedListener{
-		fn: fn,
-	}
-}
-
-func (c *ReconnectingClient) AddConnectedListener(l *ConnectedListener) {
-	c.connectedListeners[l] = struct{}{}
-}
-
-func (c *ReconnectingClient) RemoveConnectedListener(l *ConnectedListener) {
-	delete(c.connectedListeners, l)
-}
-
-func (c *ReconnectingClient) notifyConnected() {
-	for l := range c.connectedListeners {
-		l.fn(c)
-	}
-}
-
-type DisconnectedListener struct {
-	fn func(client *ReconnectingClient)
-}
-
-func NewDisconnectedListener(fn func(client *ReconnectingClient)) *DisconnectedListener {
-	return &DisconnectedListener{
-		fn: fn,
-	}
-}
-
-func (c *ReconnectingClient) AddDisconnectedListener(l *DisconnectedListener) {
-	c.disconnectedListeners[l] = struct{}{}
-}
-
-func (c *ReconnectingClient) RemoveDisconnectedListener(l *DisconnectedListener) {
-	delete(c.disconnectedListeners, l)
-}
-
-func (c *ReconnectingClient) notifyDisconnected() {
-	for l := range c.disconnectedListeners {
-		l.fn(c)
-	}
-}
-
-type SubsystemsChangedListener struct {
-	fn func(client *ReconnectingClient, subsystems []Subsystem)
-}
-
-func NewSubsystemsChangedListener(fn func(client *ReconnectingClient, subsystems []Subsystem)) *SubsystemsChangedListener {
-	return &SubsystemsChangedListener{
-		fn: fn,
-	}
-}
-
-func (c *ReconnectingClient) AddSubsystemsChangedListener(l *SubsystemsChangedListener) {
-	c.subsystemsChangedListeners[l] = struct{}{}
-}
-
-func (c *ReconnectingClient) RemoveSubsystemsChangedListener(l *SubsystemsChangedListener) {
-	delete(c.subsystemsChangedListeners, l)
-}
-
-func (c *ReconnectingClient) notifySubsystemsChanged(subsystems []Subsystem) {
-	for l := range c.subsystemsChangedListeners {
-		l.fn(c, subsystems)
-	}
 }

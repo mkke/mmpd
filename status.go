@@ -1,6 +1,7 @@
 package mmpd
 
 import (
+	"fmt"
 	"strconv"
 
 	"github.com/fhs/gompd/v2/mpd"
@@ -134,6 +135,8 @@ func ParseStatusAttrs(attrs mpd.Attrs) *Status {
 			status.UpdatingDB = v
 		case "error":
 			status.Error = v
+		default:
+			fmt.Printf("Unknown status attribute '%s' => '%s'\n", k, v)
 		}
 	}
 	return status

@@ -1,6 +1,8 @@
 package mmpd
 
-import "strings"
+import (
+	"strings"
+)
 
 type OffOnOneshot string
 
@@ -17,6 +19,6 @@ func ParseOffOnOneshot(s string) OffOnOneshot {
 	case "oneshot":
 		return Oneshot
 	default:
-		return ""
+		return Off
 	}
 }

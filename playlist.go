@@ -1,11 +1,24 @@
 package mmpd
 
 import (
+	"reflect"
 	"strconv"
 	"strings"
 
 	"github.com/fhs/gompd/v2/mpd"
 )
+
+type Playlist struct {
+	Entries []*PlaylistEntry
+}
+
+func NewPlaylist(attrsList []mpd.Attrs) *Playlist {
+	entries := make([]*PlaylistEntry, len(attrsList))
+	for idx, attrs := range attrsList {
+		entries[idx] = ParsePlaylistEntryAttrs(attrs)
+	}
+	return &Playlist{Entries: entries}
+}
 
 // PlaylistEntry represents song attributes of a playlist entry.
 type PlaylistEntry struct {
@@ -128,6 +141,16 @@ type PlaylistEntry struct {
 
 	// the time stamp when the file was added in ISO 8601. A negative value means that this is unknown/unavailable. Example: “2023-11-25T13:25:07Z”
 	Added string
+}
+
+func (pe *PlaylistEntry) Equals(other *PlaylistEntry) bool {
+	if pe == nil && other == nil {
+		return true
+	} else if pe != nil && other != nil {
+		return reflect.DeepEqual(pe, other)
+	} else {
+		return false
+	}
 }
 
 func ParsePlaylistEntryAttrs(attrs mpd.Attrs) *PlaylistEntry {

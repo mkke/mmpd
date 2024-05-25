@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/fhs/gompd/v2/mpd"
+	"github.com/go-test/deep"
 	"github.com/linkdata/deadlock"
 )
 
@@ -14,23 +16,28 @@ var ErrNotConnected = errors.New("not connected")
 
 type ReconnectingClient struct {
 	*mpd.Client
-	network                    string
-	addr                       string
-	password                   string
-	keepalive                  bool
-	pingFunc                   PingFunc
-	blocking                   bool
-	watchSubsystems            []Subsystem
-	connectLock                deadlock.RWMutex
-	idleStateLock              deadlock.Mutex
-	activeCommands             int
-	closeCh                    chan struct{}
-	keepaliveTicker            *time.Ticker
-	Playlist                   []PlaylistEntry
-	ConnectedListeners         *ListenerSet[*ConnectedListener]
-	DisconnectedListeners      *ListenerSet[*DisconnectedListener]
-	SubsystemsChangedListeners *ListenerSet[*SubsystemsChangedListener]
-	StatusChangedListeners     *ListenerSet[*StatusChangedListener]
+	network                     string
+	addr                        string
+	password                    string
+	keepalive                   bool
+	pingFunc                    PingFunc
+	blocking                    bool
+	watchSubsystems             []Subsystem
+	connectLock                 deadlock.RWMutex
+	idleStateLock               deadlock.Mutex
+	activeCommands              int
+	isConnected                 atomic.Bool
+	closeCh                     chan struct{}
+	keepaliveTicker             *time.Ticker
+	PlaylistCache               atomic.Pointer[Playlist]
+	StatusCache                 atomic.Pointer[Status]
+	CurrentSongCache            atomic.Pointer[CurrentSong]
+	ConnectedListeners          *ListenerSet[*ConnectedListener]
+	DisconnectedListeners       *ListenerSet[*DisconnectedListener]
+	SubsystemsChangedListeners  *ListenerSet[*SubsystemsChangedListener]
+	StatusChangedListeners      *ListenerSet[*StatusChangedListener]
+	PlaylistChangedListeners    *ListenerSet[*PlaylistChangedListener]
+	CurrentSongChangedListeners *ListenerSet[*CurrentSongChangedListener]
 }
 
 type ClientOption func(*ReconnectingClient)
@@ -75,16 +82,16 @@ func WithWatchSubsystems(subsystems ...Subsystem) ClientOption {
 
 func NewReconnectingClient(network, addr string, options ...ClientOption) (*ReconnectingClient, error) {
 	c := &ReconnectingClient{
-		network:   network,
-		addr:      addr,
-		keepalive: true,
-		pingFunc: func(client *ReconnectingClient) error {
-			return client.Ping()
-		},
-		ConnectedListeners:         NewListenerSet[*ConnectedListener](),
-		DisconnectedListeners:      NewListenerSet[*DisconnectedListener](),
-		SubsystemsChangedListeners: NewListenerSet[*SubsystemsChangedListener](),
-		StatusChangedListeners:     NewListenerSet[*StatusChangedListener](),
+		network:                     network,
+		addr:                        addr,
+		keepalive:                   true,
+		pingFunc:                    RefreshCache,
+		ConnectedListeners:          NewListenerSet[*ConnectedListener](),
+		DisconnectedListeners:       NewListenerSet[*DisconnectedListener](),
+		SubsystemsChangedListeners:  NewListenerSet[*SubsystemsChangedListener](),
+		StatusChangedListeners:      NewListenerSet[*StatusChangedListener](),
+		PlaylistChangedListeners:    NewListenerSet[*PlaylistChangedListener](),
+		CurrentSongChangedListeners: NewListenerSet[*CurrentSongChangedListener](),
 	}
 	for _, option := range options {
 		option(c)
@@ -126,6 +133,7 @@ func (c *ReconnectingClient) connect() error {
 	} else {
 		c.Client = client
 		c.closeCh = make(chan struct{})
+		c.isConnected.Store(true)
 		if c.keepalive {
 			c.keepaliveTicker = time.NewTicker(time.Minute)
 			go func() {
@@ -138,6 +146,7 @@ func (c *ReconnectingClient) connect() error {
 						if err := c.pingFunc(c); err != nil {
 							c.connectLock.RUnlock()
 							fmt.Printf("mpd: keepalive ping failed: %v; starting reconnect...\n", err)
+							c.isConnected.Store(false)
 							c.reconnect()
 						} else {
 							c.connectLock.RUnlock()
@@ -150,6 +159,10 @@ func (c *ReconnectingClient) connect() error {
 		fmt.Printf("mpd: notifying connected to %s %s\n", c.network, c.addr)
 		// allow the listeners to acquire the connectLock
 		go c.ConnectedListeners.Notify(func(l *ConnectedListener) { l.Connected(c) })
+
+		if c.keepalive {
+			go c.pingFunc(c)
+		}
 		return nil
 	}
 }
@@ -196,6 +209,7 @@ func (c *ReconnectingClient) close() error {
 	if c.Client != nil {
 		err := c.Client.Close()
 		c.Client = nil
+		c.isConnected.Store(false)
 		fmt.Printf("mpd: notifying disconnected from %s %s\n", c.network, c.addr)
 		// allow the listeners to acquire the connectLock
 		go c.DisconnectedListeners.Notify(func(l *DisconnectedListener) { l.Disconnected(c) })
@@ -203,6 +217,10 @@ func (c *ReconnectingClient) close() error {
 	}
 
 	return nil
+}
+
+func (c *ReconnectingClient) IsConnected() bool {
+	return c.isConnected.Load()
 }
 
 // Do runs a client command.
@@ -255,4 +273,55 @@ func (c *ReconnectingClient) idle(subsystems ...Subsystem) ([]Subsystem, error) 
 func (c *ReconnectingClient) noIdle() ([]Subsystem, error) {
 	subsystems, err := c.Command("noidle").Strings("changed")
 	return SubsystemsForStrings(subsystems), err
+}
+
+func (c *ReconnectingClient) ReloadStatus() error {
+	return RefreshCache(c)
+}
+
+func Ping(client *ReconnectingClient) error {
+	return client.Ping()
+}
+
+func RefreshCache(client *ReconnectingClient) error {
+	// This will get called only once per keep-alive for the mpd client instance,
+	// so we use listeners to get it to all interested action instances.
+	if attrs, err := client.Status(); err != nil {
+		return err
+	} else {
+		status := ParseStatusAttrs(attrs)
+		oldStatus := client.StatusCache.Swap(status)
+
+		if oldStatus == nil || status.Playlist != oldStatus.Playlist {
+			fmt.Printf("mpd: playlist id changed to %d\n", status.Playlist)
+			if attrsList, err := client.PlaylistInfo(-1, -1); err != nil {
+				return err
+			} else {
+				fmt.Printf("mpd: received new playlist #%d len=%d\n", status.Playlist, len(attrsList))
+				newPlaylist := NewPlaylist(attrsList)
+				client.PlaylistCache.Store(newPlaylist)
+
+				go client.PlaylistChangedListeners.Notify(func(l *PlaylistChangedListener) {
+					l.PlaylistChanged(client, newPlaylist)
+				})
+			}
+		}
+
+		if oldStatus == nil || !status.Equals(oldStatus) {
+			fmt.Printf("mpd: status changed (%v)\n", deep.Equal(oldStatus, status))
+			go client.StatusChangedListeners.Notify(func(l *StatusChangedListener) {
+				l.StatusChanged(client, status)
+			})
+
+			currentSong := NewCurrentSong(status, client.PlaylistCache.Load())
+			oldCurrentSong := client.CurrentSongCache.Swap(currentSong)
+			if oldCurrentSong == nil || !currentSong.Equals(oldCurrentSong) {
+				fmt.Printf("mpd: current song changed (%v): %#v\n", deep.Equal(oldCurrentSong, currentSong), currentSong)
+				go client.CurrentSongChangedListeners.Notify(func(l *CurrentSongChangedListener) {
+					l.CurrentSongChanged(client, currentSong)
+				})
+			}
+		}
+		return nil
+	}
 }

@@ -4,6 +4,7 @@ go 1.22.2
 
 require (
 	github.com/fhs/gompd/v2 v2.3.0
+	github.com/go-test/deep v1.1.0
 	github.com/linkdata/deadlock v0.4.0
 )
 

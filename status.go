@@ -2,6 +2,7 @@ package mmpd
 
 import (
 	"fmt"
+	"reflect"
 	"strconv"
 
 	"github.com/fhs/gompd/v2/mpd"
@@ -77,6 +78,10 @@ type Status struct {
 
 	// if there is an error, returns message here
 	Error string
+}
+
+func (s *Status) Equals(other *Status) bool {
+	return reflect.DeepEqual(s, other)
 }
 
 func ParseStatusAttrs(attrs mpd.Attrs) *Status {
